@@ -1,0 +1,13 @@
+cat > nixpacks.toml << 'EOF'
+[phases.setup]
+nixPkgs = ['nodejs_18']
+
+[phases.install]
+cmds = ['npm install --legacy-peer-deps']
+
+[phases.build]
+cmds = []
+
+[start]
+cmd = 'npm start'
+EOF
