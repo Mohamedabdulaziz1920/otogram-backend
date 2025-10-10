@@ -3,5 +3,5 @@ cat > nixpacks.toml << 'EOF'
 cmds = ['npm install --legacy-peer-deps']
 
 [start]
-cmd = 'npm start'
+cmd = 'npm run start'
 EOF
