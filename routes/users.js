@@ -1,11 +1,11 @@
 const express = require('express');
 const mongoose = require('mongoose');
 const multer = require('multer');
-const streamifier = require('streamifier');
 const User = require('../models/User');
 const Video = require('../models/Video');
 const auth = require('../middleware/auth');
 const isAdmin = require('../middleware/isAdmin');
+const { uploadImageToR2, deleteImageFromR2 } = require('../config/r2');
 
 const router = express.Router();
 
@@ -40,102 +40,124 @@ router.get('/me', auth, async (req, res) => {
   }
 });
 
-// ✨ تحديث صورة البروفايل بالطريقة الجديدة والناجحة ✨
+// ✨ تحديث صورة البروفايل باستخدام Cloudflare R2 ✨
 router.post('/me/update-profile-image', auth, upload.single('profileImage'), async (req, res) => {
   try {
     console.log('📸 Starting profile image update for user:', req.user._id);
     
     if (!req.file) {
-      console.warn('⚠️  No file received in request');
+      console.warn('⚠️ No file received in request');
       return res.status(400).json({ error: 'لم يتم استلام أي ملف صورة.' });
     }
     
     console.log('📁 File received:', {
       originalname: req.file.originalname,
       mimetype: req.file.mimetype,
-      size: req.file.size
+      size: `${(req.file.size / 1024).toFixed(2)} KB`
     });
-    
-    // استخدم imageBucket الذي أعددناه في server.js
-    const bucket = req.imageBucket;
-    
-    if (!bucket) {
-      console.error('❌ Image bucket not initialized');
-      return res.status(500).json({ error: 'خدمة رفع الصور غير متاحة حالياً' });
+
+    // الحصول على بيانات المستخدم الحالية
+    const user = await User.findById(req.user._id);
+    if (!user) {
+      return res.status(404).json({ error: 'المستخدم غير موجود' });
     }
-    
-    const filename = `profile-${req.user._id}-${Date.now()}`;
-    const uploadStream = bucket.openUploadStream(filename, { 
-      contentType: req.file.mimetype,
-      metadata: {
-        userId: req.user._id,
-        uploadDate: new Date(),
-        originalName: req.file.originalname
-      }
-    });
 
-    streamifier.createReadStream(req.file.buffer).pipe(uploadStream);
-
-    uploadStream.on('error', (error) => {
-      console.error('❌ GridFS Image Stream Error:', error);
-      return res.status(500).json({ error: 'فشل أثناء بث الصورة إلى قاعدة البيانات.' });
-    });
-
-    uploadStream.on('finish', async () => {
+    // حذف الصورة القديمة من R2 (إذا كانت موجودة)
+    if (user.profileImage && user.profileImage.includes(process.env.R2_PUBLIC_URL)) {
       try {
-        console.log('✅ Image uploaded to GridFS with ID:', uploadStream.id);
-        
-        const newProfileImageUrl = `/api/files/images/${uploadStream.id}`;
+        console.log('🗑️ Attempting to delete old profile image');
+        await deleteImageFromR2(user.profileImage);
+        console.log('✅ Old image deleted successfully');
+      } catch (deleteError) {
+        console.warn('⚠️ Could not delete old image:', deleteError.message);
+        // نستمر حتى لو فشل حذف الصورة القديمة
+      }
+    }
 
-        // حذف الصورة القديمة من GridFS
-        try {
-          if (req.user.profileImage && req.user.profileImage !== '/default-avatar.png') {
-            const oldFileId = req.user.profileImage.split('/').pop();
-            if (oldFileId && mongoose.Types.ObjectId.isValid(oldFileId)) {
-              console.log('🗑️  Deleting old profile image:', oldFileId);
-              await bucket.delete(new mongoose.Types.ObjectId(oldFileId));
-              console.log('✅ Old image deleted');
-            }
-          }
-        } catch (deleteError) {
-          console.warn('⚠️  Could not delete old image:', deleteError.message);
-          // نستمر في العملية حتى لو فشل الحذف
-        }
+    // رفع الصورة الجديدة إلى R2
+    console.log('📤 Uploading new profile image to R2...');
+    const uploadedImage = await uploadImageToR2(
+      req.file.buffer,
+      req.file.originalname,
+      req.file.mimetype,
+      'profiles' // مجلد خاص بصور البروفايل
+    );
 
-        // تحديث بيانات المستخدم
-        const updatedUser = await User.findByIdAndUpdate(
-          req.user._id,
-          { 
-            profileImage: newProfileImageUrl,
-            profileImageFileId: uploadStream.id
-          },
-          { new: true }
-        ).select('-password');
-        
-        console.log('✅ User profile updated successfully');
-        
-        res.status(200).json({
-          message: 'تم تحديث صورة البروفايل بنجاح',
-          profileImage: updatedUser.profileImage,
-          user: updatedUser
-        });
+    console.log('✅ Image uploaded to R2:', uploadedImage.url);
 
-      } catch (saveError) {
-        console.error('❌ Error updating user profile image:', saveError);
-        // حذف الصورة الجديدة في حالة فشل التحديث
-        try {
-          await bucket.delete(uploadStream.id);
-          console.log('🗑️  Rolled back: New image deleted');
-        } catch (rollbackError) {
-          console.error('❌ Rollback failed:', rollbackError);
-        }
-        res.status(500).json({ error: 'فشل تحديث بيانات المستخدم بعد رفع الصورة.' });
+    // تحديث قاعدة البيانات
+    user.profileImage = uploadedImage.url;
+    // إزالة الحقول القديمة من GridFS إن وجدت
+    if (user.profileImageFileId) {
+      user.profileImageFileId = undefined;
+    }
+    await user.save();
+
+    console.log('✅ User profile updated successfully');
+
+    res.status(200).json({
+      message: 'تم تحديث صورة البروفايل بنجاح',
+      profileImage: user.profileImage,
+      user: {
+        _id: user._id,
+        username: user.username,
+        email: user.email,
+        profileImage: user.profileImage,
+        bio: user.bio,
+        role: user.role
       }
     });
 
   } catch (error) {
-    console.error('❌ Top-level profile image upload error:', error);
-    res.status(500).json({ error: 'حدث خطأ غير متوقع في بداية عملية الرفع.' });
+    console.error('❌ Error updating profile image:', error);
+    res.status(500).json({ 
+      error: 'حدث خطأ أثناء تحديث صورة البروفايل',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// ✨ حذف صورة البروفايل
+router.delete('/me/profile-image', auth, async (req, res) => {
+  try {
+    console.log('🗑️ Deleting profile image for user:', req.user._id);
+
+    const user = await User.findById(req.user._id);
+    if (!user) {
+      return res.status(404).json({ error: 'المستخدم غير موجود' });
+    }
+
+    // حذف من R2 إذا كانت محفوظة في R2
+    if (user.profileImage && user.profileImage.includes(process.env.R2_PUBLIC_URL)) {
+      try {
+        await deleteImageFromR2(user.profileImage);
+        console.log('✅ Image deleted from R2');
+      } catch (error) {
+        console.warn('⚠️ Error deleting from R2:', error.message);
+      }
+    }
+
+    // تحديث قاعدة البيانات (استخدام الصورة الافتراضية)
+    user.profileImage = '/default-avatar.png';
+    user.profileImageFileId = undefined;
+    await user.save();
+
+    console.log('✅ Profile image removed successfully');
+
+    res.json({ 
+      message: 'تم حذف صورة الملف الشخصي',
+      profileImage: user.profileImage,
+      user: {
+        _id: user._id,
+        username: user.username,
+        email: user.email,
+        profileImage: user.profileImage
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Error deleting profile image:', error);
+    res.status(500).json({ error: 'فشل حذف صورة الملف الشخصي' });
   }
 });
 
@@ -222,7 +244,7 @@ router.patch('/me/update-username', auth, async (req, res) => {
     });
     
     if (existingUser) {
-      console.warn('⚠️  Username already taken:', trimmedUsername);
+      console.warn('⚠️ Username already taken:', trimmedUsername);
       return res.status(409).json({ error: 'اسم المستخدم محجوز بالفعل' });
     }
     
@@ -393,7 +415,7 @@ router.delete('/:userId', auth, isAdmin, async (req, res) => {
   try {
     const { userId } = req.params;
     
-    console.log('🗑️  Admin deleting user:', userId);
+    console.log('🗑️ Admin deleting user:', userId);
     
     // منع حذف النفس
     if (userId === req.user._id.toString()) {
@@ -404,6 +426,16 @@ router.delete('/:userId', auth, isAdmin, async (req, res) => {
     const targetUser = await User.findById(userId);
     if (!targetUser) {
       return res.status(404).json({ error: 'المستخدم غير موجود' });
+    }
+    
+    // حذف صورة البروفايل من R2 إن وجدت
+    if (targetUser.profileImage && targetUser.profileImage.includes(process.env.R2_PUBLIC_URL)) {
+      try {
+        await deleteImageFromR2(targetUser.profileImage);
+        console.log('✅ Profile image deleted from R2');
+      } catch (error) {
+        console.warn('⚠️ Could not delete profile image:', error.message);
+      }
     }
     
     // حذف جميع فيديوهات المستخدم
@@ -479,7 +511,7 @@ router.get('/profile/:username', async (req, res) => {
     const user = await User.findOne({ username }).select('-password').lean();
     
     if (!user) {
-      console.warn('⚠️  User not found:', username);
+      console.warn('⚠️ User not found:', username);
       return res.status(404).json({ error: 'المستخدم غير موجود' });
     }
 
@@ -495,7 +527,7 @@ router.get('/profile/:username', async (req, res) => {
         .lean(),
       Video.find({ user: user._id, isReply: true })
         .populate('user', 'username profileImage')
-        .populate('parentVideo', 'description user videoUrl thumbnail') // ← استخدم parentVideo بدلاً من replyTo
+        .populate('parentVideo', 'description user videoUrl thumbnail')
         .sort({ createdAt: -1 })
         .lean()
     ]);
