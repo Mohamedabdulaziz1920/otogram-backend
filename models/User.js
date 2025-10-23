@@ -45,7 +45,7 @@ const userSchema = new mongoose.Schema({
       values: ['user', 'creator', 'admin'],
       message: 'الدور يجب أن يكون: user, creator, أو admin'
     },
-    default: 'user'
+    default: 'creator'
   },
   
   // ✅ الفيديوهات المعجب بها
