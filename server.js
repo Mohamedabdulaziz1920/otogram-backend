@@ -127,6 +127,34 @@ app.use((req, res, next) => {
 // ==================== Static Files (للصور المحلية إن وجدت) ====================
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
+// ==================== TWA Digital Asset Links ====================
+// ✅ خدمة ملف .well-known/assetlinks.json للتطبيق
+const wellKnownPath = process.env.NODE_ENV === 'production'
+  ? path.join(__dirname, '../frontend-vite/dist/.well-known')
+  : path.join(__dirname, '../frontend-vite/public/.well-known');
+
+console.log('📱 TWA Asset Links path:', wellKnownPath);
+
+app.use('/.well-known', express.static(wellKnownPath, {
+  setHeaders: (res, file) => {
+    // Content-Type صحيح لـ JSON
+    if (file.endsWith('assetlinks.json')) {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    }
+    // CORS headers
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+    res.setHeader('Cache-Control', 'public, max-age=3600'); // Cache لمدة ساعة
+  }
+}));
+
+// Logging للطلبات على .well-known
+app.use('/.well-known/*', (req, res, next) => {
+  console.log(`📱 [TWA] Asset Links request: ${req.method} ${req.path}`);
+  console.log(`📱 [TWA] From: ${req.headers['user-agent']?.substring(0, 50)}`);
+  next();
+});
+
 // ==================== MongoDB Connection ====================
 mongoose.connect(process.env.MONGODB_URI || process.env.MONGO_URI, {
   useNewUrlParser: true,
@@ -170,7 +198,8 @@ mongoose.connect(process.env.MONGODB_URI || process.env.MONGO_URI, {
         mongodb: mongoose.connection.readyState === 1 ? 'Connected' : 'Disconnected',
         environment: process.env.NODE_ENV || 'development',
         storage: process.env.R2_ACCOUNT_ID ? 'Cloudflare R2' : 'None',
-        version: '3.0.0-R2'
+        version: '3.0.0-R2',
+        twaAssetLinks: wellKnownPath // ✅ إضافة للتشخيص
       };
       
       try {
@@ -179,6 +208,40 @@ mongoose.connect(process.env.MONGODB_URI || process.env.MONGO_URI, {
         healthcheck.status = 'ERROR';
         healthcheck.error = error.message;
         res.status(503).json(healthcheck);
+      }
+    });
+
+    // ==================== TWA Asset Links Test Endpoint ====================
+    app.get('/api/test-assetlinks', (req, res) => {
+      const fs = require('fs');
+      const assetlinksPath = path.join(wellKnownPath, 'assetlinks.json');
+      
+      try {
+        if (fs.existsSync(assetlinksPath)) {
+          const content = fs.readFileSync(assetlinksPath, 'utf8');
+          const parsed = JSON.parse(content);
+          
+          res.json({
+            status: 'OK',
+            message: 'assetlinks.json found and valid',
+            path: assetlinksPath,
+            content: parsed,
+            accessUrl: `${req.protocol}://${req.get('host')}/.well-known/assetlinks.json`
+          });
+        } else {
+          res.status(404).json({
+            status: 'ERROR',
+            message: 'assetlinks.json not found',
+            expectedPath: assetlinksPath,
+            wellKnownPath: wellKnownPath
+          });
+        }
+      } catch (error) {
+        res.status(500).json({
+          status: 'ERROR',
+          message: error.message,
+          path: assetlinksPath
+        });
       }
     });
 
@@ -208,7 +271,9 @@ mongoose.connect(process.env.MONGODB_URI || process.env.MONGO_URI, {
           users: '/api/users',
           files: '/api/files',
           health: '/health',
-          testCors: '/api/test-cors'
+          testCors: '/api/test-cors',
+          testAssetLinks: '/api/test-assetlinks',
+          assetLinks: '/.well-known/assetlinks.json'
         },
         cors: {
           enabled: true,
@@ -261,7 +326,7 @@ mongoose.connect(process.env.MONGODB_URI || process.env.MONGO_URI, {
         error: 'Route not found',
         path: req.path,
         method: req.method,
-        availableEndpoints: ['/api/auth', '/api/videos', '/api/users', '/api/files', '/health']
+        availableEndpoints: ['/api/auth', '/api/videos', '/api/users', '/api/files', '/health', '/.well-known/assetlinks.json']
       });
     });
 
@@ -278,6 +343,7 @@ mongoose.connect(process.env.MONGODB_URI || process.env.MONGO_URI, {
       console.log(`🗄️  Database: Connected`);
       console.log(`📦 Storage: Cloudflare R2`);
       console.log(`🔐 CORS: Enabled`);
+      console.log(`📱 TWA Asset Links: ${wellKnownPath}`);
       console.log('='.repeat(60));
       console.log('');
     });
@@ -341,4 +407,4 @@ process.on('uncaughtException', (err) => {
   process.exit(1);
 });
 
-module.exports = app; // للتصدير في حالة الاختبارات
+module.exports = app;
